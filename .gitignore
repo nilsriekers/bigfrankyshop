@@ -1,0 +1,27 @@
+# WordPress uploads and cache
+uploads/
+themes/
+plugins/
+
+# SSL certificates (auto-generated)
+nginx/ssl/
+
+# Backup files
+backups/
+*.tar.gz
+
+# Setup scripts (one-time use)
+scripts/
+setup-*.sh
+init-ssl.sh
+test-setup.sh
+
+# Docker volumes
+volumes/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+.DS_Store 

@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # MySQL Database
+  db:
+    image: mysql:8.0
+    container_name: wordpress_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-strong_root_password_123}
+      MYSQL_DATABASE: ${DB_NAME:-wordpress}
+      MYSQL_USER: ${DB_USER:-wordpress}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-wordpress_password_123}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./backups:/backups
+    networks:
+      - wordpress_network
+    command: '--default-authentication-plugin=mysql_native_password'
+
+  # WordPress with Apache
+  wordpress:
+    image: wordpress:6.5-apache
+    container_name: wordpress_app
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: ${DB_NAME:-wordpress}
+      WORDPRESS_DB_USER: ${DB_USER:-wordpress}
+      WORDPRESS_DB_PASSWORD: ${DB_PASSWORD:-wordpress_password_123}
+      WORDPRESS_TABLE_PREFIX: ${WP_TABLE_PREFIX:-wp_}
+    volumes:
+      - wordpress_data:/var/www/html
+      - ./wp-config.php:/var/www/html/wp-config.php
+      - ./uploads:/var/www/html/wp-content/uploads
+      - ./plugins:/var/www/html/wp-content/plugins
+      - ./themes:/var/www/html/wp-content/themes
+      - ./backups:/backups
+    networks:
+      - wordpress_network
+
+  # Nginx Reverse Proxy with SSL
+  nginx:
+    image: nginx:alpine
+    container_name: wordpress_nginx
+    restart: unless-stopped
+    depends_on:
+      - wordpress
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/ssl:/etc/nginx/ssl
+      - certbot_data:/var/www/certbot
+    networks:
+      - wordpress_network
+    command: "/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g \"daemon off;\"'"
+
+  # Certbot for SSL certificates
+  certbot:
+    image: certbot/certbot
+    container_name: wordpress_certbot
+    volumes:
+      - ./nginx/ssl:/etc/letsencrypt
+      - certbot_data:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+  # phpMyAdmin for database management
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: wordpress_phpmyadmin
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      PMA_HOST: db
+      PMA_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-strong_root_password_123}
+    ports:
+      - "8080:80"
+    networks:
+      - wordpress_network
+
+  # Redis for caching (optional, good for Kubernetes)
+  redis:
+    image: redis:7-alpine
+    container_name: wordpress_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_password_123}
+    volumes:
+      - redis_data:/data
+    networks:
+      - wordpress_network
+
+volumes:
+  db_data:
+    driver: local
+  wordpress_data:
+    driver: local
+  redis_data:
+    driver: local
+  certbot_data:
+    driver: local
+
+networks:
+  wordpress_network:
+    driver: bridge 
