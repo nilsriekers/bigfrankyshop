@@ -16,11 +16,13 @@ services:
       - ./backups:/backups
     networks:
       - wordpress_network
+      - webnet
     command: '--default-authentication-plugin=mysql_native_password'
 
-  # WordPress with Apache
   wordpress:
-    image: wordpress:6.5-apache
+    build:
+      context: .
+      dockerfile: Dockerfile.wp
     container_name: wordpress_app
     restart: unless-stopped
     depends_on:
@@ -40,6 +42,7 @@ services:
       - ./backups:/backups
     networks:
       - wordpress_network
+      - webnet
 
   # Nginx Reverse Proxy with SSL
   nginx:
@@ -57,6 +60,7 @@ services:
       - certbot_data:/var/www/certbot
     networks:
       - wordpress_network
+      - webnet
     command: "/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g \"daemon off;\"'"
 
   # Certbot for SSL certificates
@@ -83,6 +87,7 @@ services:
       - "8080:80"
     networks:
       - wordpress_network
+      - webnet
 
   # Redis for caching (optional, good for Kubernetes)
   redis:
@@ -94,6 +99,20 @@ services:
       - redis_data:/data
     networks:
       - wordpress_network
+      - webnet
+
+  # Ticket-Engine für Scanner und PDF-Generierung
+  ticket-engine:
+    build: ../ticket-engine
+    container_name: ticket-engine-wp
+    restart: unless-stopped
+    environment:
+      - API_KEY=supersecret123
+    volumes:
+      - ../ticket-engine:/app
+    networks:
+      - wordpress_network
+      - webnet
 
 volumes:
   db_data:
@@ -107,4 +126,6 @@ volumes:
 
 networks:
   wordpress_network:
-    driver: bridge 
+    driver: bridge
+  webnet:
+    external: true 

@@ -1,0 +1,7 @@
+FROM wordpress:6.5-apache
+
+# SOAP braucht libxml2-dev
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libxml2-dev \
+ && docker-php-ext-install soap \
+ && rm -rf /var/lib/apt/lists/*

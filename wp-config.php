@@ -3,6 +3,8 @@
  * WordPress configuration file
  */
 
+define( 'WC_GZD_ENCRYPTION_KEY', '0f7ae85baabfc1c87716706d47b97c3f7a6f8d9c7e107a5b6f1e7a0aaec90f40' );
+
 // ** Database settings ** //
 define('DB_NAME', 'wordpress');
 define('DB_USER', 'wordpress');
