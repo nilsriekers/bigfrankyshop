@@ -107,7 +107,7 @@ services:
     container_name: ticket-engine-wp
     restart: unless-stopped
     environment:
-      - API_KEY=supersecret123
+      - API_KEY=wgorgnwr#oG!ORG4NO
     volumes:
       - ../ticket-engine:/app
     networks:

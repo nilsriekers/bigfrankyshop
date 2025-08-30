@@ -84,6 +84,27 @@ function wjt_generate_ticket_pdfs_if_needed( $order_id ) {
             $ticket_uuid = wp_generate_uuid4();
             $ticket_id = wjt_generate_ticket_id($order_id, $idx);
 
+            // Event-Informationen aus Produkt-Metadaten sammeln
+            $product = $item->get_product();
+            $product_id = $product ? $product->get_id() : 0;
+            
+                // Event-Daten aus Custom Fields laden
+    $event_location = get_post_meta($product_id, '_wjt_event_location', true);
+    $event_date = get_post_meta($product_id, '_wjt_event_date', true);
+    $event_time = get_post_meta($product_id, '_wjt_event_time', true);
+    $event_address = get_post_meta($product_id, '_wjt_event_address', true);
+    $event_description = get_post_meta($product_id, '_wjt_event_description', true);
+    $event_organizer = get_post_meta($product_id, '_wjt_event_organizer', true);
+    $event_website = get_post_meta($product_id, '_wjt_event_website', true);
+    $event_contact = get_post_meta($product_id, '_wjt_event_contact', true);
+            
+            // Fallback: Aus Produktbeschreibung oder Standard-Werten
+            if (empty($event_organizer)) {
+                $event_organizer = get_bloginfo('name'); // Website-Name als Veranstalter
+            }
+            
+            // Event-Daten wurden erfolgreich geladen
+
             $payload = [
                 'ticket_uuid' => $ticket_uuid,
                 'ticket_number' => $ticket_id,
@@ -96,7 +117,18 @@ function wjt_generate_ticket_pdfs_if_needed( $order_id ) {
                 'qr_validation_url' => home_url('/wp-admin/admin-ajax.php?action=wjt_validate_ticket&uuid=' . $ticket_uuid),
                 'ticket_price' => $item->get_total() / $qty, // Preis pro Ticket
                 'currency' => $order->get_currency(),
+                
+                // Event-Informationen für erweiterte PDF-Generierung
+                'event_location' => $event_location ?: null,
+                'event_date' => $event_date ?: null,
+                'event_time' => $event_time ?: null,
+                'event_address' => $event_address ?: null,
+                'event_description' => $event_description ?: null,
+                'event_organizer' => $event_organizer ?: null,
+                'event_website' => $event_website ?: null,
+                'event_contact' => $event_contact ?: null,
             ];
+
 
             $headers = ['Content-Type'=>'application/json'];
             if (WJT_API_KEY !== '') {
@@ -126,14 +158,20 @@ function wjt_generate_ticket_pdfs_if_needed( $order_id ) {
             wc_update_order_item_meta($item_id, WJT_META_SCAN_COUNT.$idx, '0');
             wc_update_order_item_meta($item_id, WJT_META_FIRST_SCAN.$idx, '');
 
-            // Pfad/URL speichern
+            // Pfad/URL speichern - NUR UUID (SICHER)
             if (WJT_ATTACH_PDF && $pdf_b64){
                 $upload_dir = wp_upload_dir();
                 $dir = trailingslashit($upload_dir['basedir']).'tickets';
                 if (!file_exists($dir)) wp_mkdir_p($dir);
+                
+                // Nur UUID-Datei speichern (sicher, nicht erratbar)
                 $path = trailingslashit($dir).$ticket_uuid.'.pdf';
                 file_put_contents($path, base64_decode($pdf_b64));
                 wc_update_order_item_meta($item_id, WJT_META_PDF_PATH.$idx, $path);
+                
+                // Ticket-Nummer für E-Mail-Anhang-Namen speichern
+                wc_update_order_item_meta($item_id, WJT_META_TICKET_NUMBER.$idx, $ticket_id);
+                
                 if (WJT_DEBUG_NOTES) { $order->add_order_note('Ticket #'.($idx+1).' gespeichert: '.$path); }
             }
             if ($pdf_url){
@@ -178,23 +216,84 @@ add_action('woocommerce_email_order_meta', function($order, $sent_to_admin, $pla
     }
 }, 10, 4);
 
-// Attachments für definierte E-Mails
+
+
+// E-Mail-Anhänge für Tickets mit Debug
 add_filter('woocommerce_email_attachments', function($attachments, $email_id, $order){
+    error_log("WJT EMAIL DEBUG: email_id=$email_id, WJT_ATTACH_PDF=" . (WJT_ATTACH_PDF ? 'true' : 'false'));
+    
     if (!WJT_ATTACH_PDF) return $attachments;
     if (!$order instanceof WC_Order) return $attachments;
-    if (!in_array($email_id, WJT_EMAIL_TARGETS, true)) return $attachments;
+    if (!in_array($email_id, WJT_EMAIL_TARGETS, true)) {
+        error_log("WJT EMAIL DEBUG: email_id '$email_id' not in targets: " . implode(', ', WJT_EMAIL_TARGETS));
+        return $attachments;
+    }
+
+    error_log("WJT EMAIL DEBUG: Processing order #{$order->get_id()}");
 
     foreach ($order->get_items() as $item_id => $item){
         $prod = $item->get_product(); if (!$prod) continue;
-        if ($prod->get_meta(WJT_META_IS_TICKET) !== 'yes') continue;
+        $is_ticket = $prod->get_meta(WJT_META_IS_TICKET);
+        error_log("WJT EMAIL DEBUG: Item $item_id, is_ticket='$is_ticket'");
+        
+        if ($is_ticket !== 'yes') continue;
 
         $qty = max(1, intval($item->get_quantity()));
+        error_log("WJT EMAIL DEBUG: Processing $qty tickets for item $item_id");
+        
         for ($i=0; $i < $qty; $i++){
+            // UUID-Datei lesen (sicher gespeichert)
             $path = wc_get_order_item_meta($item_id, WJT_META_PDF_PATH.$i, true);
-            if ($path && file_exists($path)){ $attachments[] = $path; }
+            if ($path && file_exists($path)){
+                // Ticket-Nummer für schönen Dateinamen
+                $ticket_number = wc_get_order_item_meta($item_id, WJT_META_TICKET_NUMBER.$i, true);
+                if ($ticket_number) {
+                    $safe_ticket_id = preg_replace('/[^a-zA-Z0-9\-_]/', '_', $ticket_number);
+                    $nice_filename = 'ticket_' . $safe_ticket_id . '.pdf';
+                    
+                    // Temporäre Kopie in SICHEREM Verzeichnis (außerhalb Web-Root)
+                    $secure_temp_dir = ABSPATH . '../wjt-email-temp/';
+                    if (!file_exists($secure_temp_dir)) {
+                        wp_mkdir_p($secure_temp_dir);
+                        // .htaccess für zusätzlichen Schutz
+                        file_put_contents($secure_temp_dir . '.htaccess', "Deny from all\n");
+                        // index.php für extra Schutz
+                        file_put_contents($secure_temp_dir . 'index.php', "<?php exit('Access denied');");
+                    }
+                    
+                    $temp_path = $secure_temp_dir . $nice_filename;
+                    copy($path, $temp_path);
+                    error_log("WJT EMAIL DEBUG: Adding secure temp attachment: $temp_path");
+                    $attachments[] = $temp_path;
+                } else {
+                    error_log("WJT EMAIL DEBUG: Adding UUID attachment: $path");
+                    $attachments[] = $path;
+                }
+            } else {
+                error_log("WJT EMAIL DEBUG: No PDF found for item $item_id index $i");
+            }
         }
     }
+    
+    error_log("WJT EMAIL DEBUG: Final attachments count: " . count($attachments));
     return $attachments;
+}, 10, 3);
+
+// Temporäre E-Mail-Dateien aufräumen (SICHER)
+add_action('woocommerce_email_sent', function($return_path, $email_id, $order) {
+    if (!in_array($email_id, WJT_EMAIL_TARGETS, true)) return;
+    
+    // Sichere temporäre Dateien sofort löschen
+    $secure_temp_dir = ABSPATH . '../wjt-email-temp/';
+    if (is_dir($secure_temp_dir)) {
+        $files = glob($secure_temp_dir . 'ticket_*.pdf');
+        foreach ($files as $file) {
+            if (is_file($file)) {
+                unlink($file);
+                error_log("WJT EMAIL DEBUG: Cleaned up temp file: $file");
+            }
+        }
+    }
 }, 10, 3);
 
 /** ============================================================
@@ -464,7 +563,7 @@ function wjt_render_tickets_admin_page(){
                         $display_text .= ' 🚫';
                     } else if ($scan_count > 0) {
                         $display_text .= ' 🟡(' . $scan_count . 'x)';
-                    } else {
+                } else {
                         $display_text .= ' ✅';
                     }
                     
@@ -1128,7 +1227,10 @@ add_action('wp_ajax_wjt_export_event', function() {
     exit;
 });
 
-// Leichtgewichtiger Scanner-Link für Admins
+// Leichtgewichtiger Scanner-Link für Admins - DEAKTIVIERT FÜR PRODUKTSEITE
+// TODO: Scanner-Link wieder aktivieren wenn Event-spezifische Scanner implementiert sind
+// oder nur im Admin-Bereich anzeigen
+/*
 add_action('wp_footer', function() {
     // Nur für eingeloggte Admins
     if (!current_user_can('manage_woocommerce')) return;
@@ -1160,3 +1262,153 @@ add_action('wp_footer', function() {
     </a>
     <?php
 });
+*/
+
+// ===== EVENT METADATEN FÜR WOOCOMMERCE PRODUKTE =====
+
+// Metabox für Event-Daten zu WooCommerce Produkten hinzufügen
+add_action('add_meta_boxes', 'wjt_add_event_metabox');
+function wjt_add_event_metabox() {
+    add_meta_box(
+        'wjt_event_details',
+        'Event-Informationen für Tickets',
+        'wjt_event_metabox_callback',
+        'product',
+        'normal',
+        'high'
+    );
+}
+
+// Metabox Content rendern
+function wjt_event_metabox_callback($post) {
+    // Nonce für Sicherheit
+    wp_nonce_field('wjt_save_event_meta', 'wjt_event_meta_nonce');
+    
+    // Aktuelle Werte laden
+    $event_location = get_post_meta($post->ID, '_wjt_event_location', true);
+    $event_date = get_post_meta($post->ID, '_wjt_event_date', true);
+    $event_time = get_post_meta($post->ID, '_wjt_event_time', true);
+    $event_address = get_post_meta($post->ID, '_wjt_event_address', true);
+    $event_description = get_post_meta($post->ID, '_wjt_event_description', true);
+    $event_organizer = get_post_meta($post->ID, '_wjt_event_organizer', true);
+    $event_website = get_post_meta($post->ID, '_wjt_event_website', true);
+    $event_contact = get_post_meta($post->ID, '_wjt_event_contact', true);
+    $is_ticket = get_post_meta($post->ID, '_wjt_is_ticket', true);
+    
+    ?>
+    <style>
+        .wjt-event-metabox { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .wjt-event-field { margin-bottom: 15px; }
+        .wjt-event-field label { display: block; font-weight: 600; margin-bottom: 5px; }
+        .wjt-event-field input, .wjt-event-field textarea { width: 100%; }
+        .wjt-event-field textarea { height: 60px; resize: vertical; }
+        .wjt-event-notice { background: #e7f3ff; border: 1px solid #b3d9ff; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        @media (max-width: 768px) { .wjt-event-metabox { grid-template-columns: 1fr; } }
+    </style>
+    
+    <div class="wjt-event-notice">
+        <p><strong>Hinweis:</strong> Diese Event-Informationen erscheinen automatisch auf den generierten Tickets, wenn das Produkt als "Ticket-Produkt" markiert ist.</p>
+        <label style="margin-top: 10px; display: block;">
+            <input type="checkbox" name="wjt_is_ticket" value="yes" <?php checked($is_ticket, 'yes'); ?>>
+            <strong>Dies ist ein Ticket-Produkt</strong>
+        </label>
+    </div>
+    
+    <div class="wjt-event-metabox">
+        <div class="wjt-event-left">
+            <div class="wjt-event-field">
+                <label for="wjt_event_location">Veranstaltungsort</label>
+                <input type="text" id="wjt_event_location" name="wjt_event_location" 
+                       value="<?php echo esc_attr($event_location); ?>" 
+                       placeholder="z.B. Konzerthalle, Club XY">
+            </div>
+            
+            <div class="wjt-event-field">
+                <label for="wjt_event_date">Datum</label>
+                <input type="date" id="wjt_event_date" name="wjt_event_date" 
+                       value="<?php echo esc_attr($event_date); ?>">
+            </div>
+            
+            <div class="wjt-event-field">
+                <label for="wjt_event_time">Uhrzeit</label>
+                <input type="time" id="wjt_event_time" name="wjt_event_time" 
+                       value="<?php echo esc_attr($event_time); ?>">
+            </div>
+            
+            <div class="wjt-event-field">
+                <label for="wjt_event_organizer">Veranstalter</label>
+                <input type="text" id="wjt_event_organizer" name="wjt_event_organizer" 
+                       value="<?php echo esc_attr($event_organizer); ?>" 
+                       placeholder="Standard: <?php echo esc_attr(get_bloginfo('name')); ?>">
+            </div>
+        </div>
+        
+        <div class="wjt-event-right">
+            <div class="wjt-event-field">
+                <label for="wjt_event_address">Adresse</label>
+                <textarea id="wjt_event_address" name="wjt_event_address" 
+                          placeholder="Vollständige Adresse des Veranstaltungsortes"><?php echo esc_textarea($event_address); ?></textarea>
+            </div>
+            
+            <div class="wjt-event-field">
+                <label for="wjt_event_description">Event-Beschreibung</label>
+                <textarea id="wjt_event_description" name="wjt_event_description" 
+                          placeholder="Kurze Beschreibung für das Ticket"><?php echo esc_textarea($event_description); ?></textarea>
+            </div>
+            
+            <div class="wjt-event-field">
+                <label for="wjt_event_website">Website</label>
+                <input type="url" id="wjt_event_website" name="wjt_event_website" 
+                       value="<?php echo esc_attr($event_website); ?>" 
+                       placeholder="https://...">
+            </div>
+            
+            <div class="wjt-event-field">
+                <label for="wjt_event_contact">Kontakt</label>
+                <input type="text" id="wjt_event_contact" name="wjt_event_contact" 
+                       value="<?php echo esc_attr($event_contact); ?>" 
+                       placeholder="E-Mail oder Telefon">
+            </div>
+        </div>
+    </div>
+    <?php
+}
+
+// Event-Metadaten speichern
+add_action('save_post', 'wjt_save_event_metadata');
+function wjt_save_event_metadata($post_id) {
+    // Prüfungen
+    if (!isset($_POST['wjt_event_meta_nonce']) || !wp_verify_nonce($_POST['wjt_event_meta_nonce'], 'wjt_save_event_meta')) {
+        return;
+    }
+    
+    if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) {
+        return;
+    }
+    
+    if (!current_user_can('edit_post', $post_id)) {
+        return;
+    }
+    
+    // Event-Daten speichern
+    $event_fields = [
+        '_wjt_event_location' => 'wjt_event_location',
+        '_wjt_event_date' => 'wjt_event_date',
+        '_wjt_event_time' => 'wjt_event_time',
+        '_wjt_event_address' => 'wjt_event_address',
+        '_wjt_event_description' => 'wjt_event_description',
+        '_wjt_event_organizer' => 'wjt_event_organizer',
+        '_wjt_event_website' => 'wjt_event_website',
+        '_wjt_event_contact' => 'wjt_event_contact',
+    ];
+    
+    foreach ($event_fields as $meta_key => $post_key) {
+        if (isset($_POST[$post_key])) {
+            update_post_meta($post_id, $meta_key, sanitize_text_field($_POST[$post_key]));
+        }
+    }
+    
+    // Ticket-Status speichern
+    $is_ticket = isset($_POST['wjt_is_ticket']) ? 'yes' : 'no';
+    update_post_meta($post_id, '_wjt_is_ticket', $is_ticket);
+}
