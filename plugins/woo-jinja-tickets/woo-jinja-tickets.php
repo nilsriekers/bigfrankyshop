@@ -22,6 +22,7 @@ const WJT_DEBUG_NOTES    = true;  // Bestellnotizen für Debug
 const WJT_EMAIL_TARGETS = [
     'customer_processing_order',  // Bestellbestätigung nach Zahlung
     'customer_completed_order',   // zusätzlich bei "abgeschlossen"
+    'customer_paid_for_order',    // PayPal-Bestellungen (wichtig!)
     // 'customer_on_hold_order',   // optional: Vorkasse/Manuell prüfen
 ];
 
@@ -190,11 +191,138 @@ add_action('woocommerce_payment_complete', function($order_id){
 // 2) Fallback: sobald Status "processing" wird (manche Gateways setzen so)
 add_action('woocommerce_order_status_processing', function($order_id){
     wjt_generate_ticket_pdfs_if_needed($order_id);
+    
+    // Auto-Complete für Ticket-only Bestellungen (DELAYED um Checkout-Flow nicht zu stören)
+    wp_schedule_single_event(time() + 30, 'wjt_delayed_auto_complete', array($order_id));
 }, 10, 1);
+
+// Delayed Auto-Complete Hook
+add_action('wjt_delayed_auto_complete', 'wjt_auto_complete_ticket_only_orders');
+
+/**
+ * Auto-Complete Bestellungen die nur Tickets enthalten
+ */
+function wjt_auto_complete_ticket_only_orders($order_id) {
+    $order = wc_get_order($order_id);
+    if (!$order) return;
+    
+    // Nur bei "processing" Status automatisch vervollständigen
+    if ($order->get_status() !== 'processing') return;
+    
+    $has_physical_products = false;
+    $has_tickets = false;
+    
+    foreach ($order->get_items() as $item_id => $item) {
+        $product = $item->get_product();
+        if (!$product) continue;
+        
+        if ($product->get_meta(WJT_META_IS_TICKET) === 'yes') {
+            $has_tickets = true;
+        } else {
+            // Prüfen ob physisches Produkt (nicht virtual und nicht downloadable)
+            if (!$product->is_virtual() && !$product->is_downloadable()) {
+                $has_physical_products = true;
+            }
+        }
+    }
+    
+    // Wenn nur Tickets und keine physischen Produkte → Auto-Complete OHNE E-Mail
+    if ($has_tickets && !$has_physical_products) {
+        // E-Mail-Hooks temporär deaktivieren
+        remove_action('woocommerce_order_status_completed', array('WC_Emails', 'send_transactional_email'), 10);
+        
+        // Status direkt setzen
+        $order->set_status('completed', 'Automatisch abgeschlossen: Bestellung enthält nur Tickets/digitale Produkte.');
+        $order->save();
+        
+        // E-Mail-Hooks wieder aktivieren für andere Bestellungen
+        add_action('woocommerce_order_status_completed', array('WC_Emails', 'send_transactional_email'), 10, 1);
+        
+        if (WJT_DEBUG_NOTES) {
+            $order->add_order_note('🎫 Auto-Complete: Ticket-only Bestellung automatisch abgeschlossen (ohne E-Mail).');
+        }
+        
+        error_log("WJT AUTO-COMPLETE: Order #$order_id silently completed (tickets only, no email)");
+    }
+}
+
+/** ============================================================
+ *  ADMIN: Testbestellungen löschen (AUSKOMMENTIERT FÜR PROD)
+ *  ============================================================ */
+
+/*
+// AJAX Handler zum Finden und Löschen von Test-Bestellungen
+add_action('wp_ajax_wjt_delete_test_orders', function() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Insufficient permissions');
+    }
+    
+    $product_name = sanitize_text_field($_POST['product_name'] ?? '');
+    if (empty($product_name)) {
+        wp_send_json_error('Produktname erforderlich');
+    }
+    
+    // 1. Produkt finden
+    $products = wc_get_products(array(
+        'name' => $product_name,
+        'limit' => 10,
+        'status' => 'any'
+    ));
+    
+    if (empty($products)) {
+        wp_send_json_error("Kein Produkt mit Name '$product_name' gefunden");
+    }
+    
+    $product_ids = array_map(function($p) { return $p->get_id(); }, $products);
+    
+    // 2. Bestellungen finden die diese Produkte enthalten
+    $orders_to_delete = array();
+    
+    $orders = wc_get_orders(array(
+        'limit' => -1,
+        'status' => 'any'
+    ));
+    
+    foreach ($orders as $order) {
+        foreach ($order->get_items() as $item) {
+            if (in_array($item->get_product_id(), $product_ids)) {
+                $orders_to_delete[] = $order->get_id();
+                break;
+            }
+        }
+    }
+    
+    // 3. Bestellungen löschen
+    $deleted_count = 0;
+    foreach ($orders_to_delete as $order_id) {
+        $order = wc_get_order($order_id);
+        if ($order) {
+            $order->delete(true); // true = force delete
+            $deleted_count++;
+        }
+    }
+    
+    wp_send_json_success(array(
+        'message' => "Erfolgreich $deleted_count Bestellungen gelöscht",
+        'product_ids' => $product_ids,
+        'deleted_orders' => $orders_to_delete
+    ));
+});
+*/
 
 /** ============================================================
  *  MAIL: Links + Attachments in gewünschten E-Mails
  *  ============================================================ */
+
+// TEMP DEBUG: Log ALLE E-Mails
+add_filter('woocommerce_email_attachments', function($attachments, $email_id, $order, $email) {
+    if ($order instanceof WC_Order) {
+        error_log("WJT DEBUG ALL EMAILS: Order #{$order->get_id()}, email_id='$email_id', attachments_count=" . count($attachments));
+    } else {
+        error_log("WJT DEBUG ALL EMAILS: email_id='$email_id', NO ORDER, attachments_count=" . count($attachments));
+    }
+    return $attachments;
+}, 5, 4); // Priorität 5 = vor unserem Filter (10)
 add_action('woocommerce_email_order_meta', function($order, $sent_to_admin, $plain_text, $email){
     if (!$email || !in_array($email->id, WJT_EMAIL_TARGETS, true)) return;
 
@@ -226,8 +354,12 @@ add_filter('woocommerce_email_attachments', function($attachments, $email_id, $o
     if (!$order instanceof WC_Order) return $attachments;
     if (!in_array($email_id, WJT_EMAIL_TARGETS, true)) {
         error_log("WJT EMAIL DEBUG: email_id '$email_id' not in targets: " . implode(', ', WJT_EMAIL_TARGETS));
+        // TEMP DEBUG: Log trotzdem
+        error_log("WJT EMAIL DEBUG: Order #{$order->get_id()} - NICHT-ZIEL-EMAIL: '$email_id'");
         return $attachments;
     }
+
+
 
     error_log("WJT EMAIL DEBUG: Processing order #{$order->get_id()}");
 
@@ -251,8 +383,9 @@ add_filter('woocommerce_email_attachments', function($attachments, $email_id, $o
                     $safe_ticket_id = preg_replace('/[^a-zA-Z0-9\-_]/', '_', $ticket_number);
                     $nice_filename = 'ticket_' . $safe_ticket_id . '.pdf';
                     
-                    // Temporäre Kopie in SICHEREM Verzeichnis (außerhalb Web-Root)
-                    $secure_temp_dir = ABSPATH . '../wjt-email-temp/';
+                    // Temporäre Kopie in SICHEREM Verzeichnis (geschützt durch .htaccess)
+                    $upload_dir = wp_upload_dir();
+                    $secure_temp_dir = $upload_dir['basedir'] . '/wjt-secure-temp/';
                     if (!file_exists($secure_temp_dir)) {
                         wp_mkdir_p($secure_temp_dir);
                         // .htaccess für zusätzlichen Schutz
@@ -279,12 +412,14 @@ add_filter('woocommerce_email_attachments', function($attachments, $email_id, $o
     return $attachments;
 }, 10, 3);
 
-// Temporäre E-Mail-Dateien aufräumen (SICHER)
+// Temporäre E-Mail-Dateien aufräumen (DEAKTIVIERT FÜR DEBUGGING)
+/*
 add_action('woocommerce_email_sent', function($return_path, $email_id, $order) {
     if (!in_array($email_id, WJT_EMAIL_TARGETS, true)) return;
     
     // Sichere temporäre Dateien sofort löschen
-    $secure_temp_dir = ABSPATH . '../wjt-email-temp/';
+    $upload_dir = wp_upload_dir();
+    $secure_temp_dir = $upload_dir['basedir'] . '/wjt-secure-temp/';
     if (is_dir($secure_temp_dir)) {
         $files = glob($secure_temp_dir . 'ticket_*.pdf');
         foreach ($files as $file) {
@@ -295,6 +430,7 @@ add_action('woocommerce_email_sent', function($return_path, $email_id, $order) {
         }
     }
 }, 10, 3);
+*/
 
 /** ============================================================
  *  QR-CODE VALIDIERUNG: AJAX Endpoint für Ticket-Scanner
@@ -452,6 +588,7 @@ function wjt_render_tickets_admin_page(){
     echo '<a href="'.esc_url($general_scanner_url).'" class="button button-primary" target="_blank">📱 Allgemeiner Scanner</a>';
     echo '<a href="'.admin_url('edit.php?post_type=product').'" class="button">➕ Ticket-Produkt erstellen</a>';
     echo '<a href="'.admin_url('admin-ajax.php?action=wjt_emergency_export').'" class="button button-secondary">📋 Notfall-Export</a>';
+    // echo '<button id="delete-test-orders" class="button button-secondary" style="background: #dc3232; color: white;">🗑️ Testbestellungen löschen</button>'; // AUSKOMMENTIERT FÜR PROD
     echo '</div>';
 
     // Filter
@@ -678,6 +815,41 @@ function wjt_render_tickets_admin_page(){
             alert('❌ Fehler beim Status-Wechsel');
         });
     }
+    
+    /*
+    // Testbestellungen löschen (AUSKOMMENTIERT FÜR PROD)
+    document.getElementById('delete-test-orders').addEventListener('click', function() {
+        const productName = prompt('Produktname für zu löschende Testbestellungen:', 'Big Franky Big Show 3 Ticket');
+        if (!productName) return;
+        
+        if (!confirm('ACHTUNG: Alle Bestellungen mit Produkt "' + productName + '" werden UNWIDERRUFLICH gelöscht!\n\nFortfahren?')) return;
+        
+        this.disabled = true;
+        this.textContent = '⏳ Lösche...';
+        
+        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'action=wjt_delete_test_orders&product_name=' + encodeURIComponent(productName)
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                alert('✅ ' + data.data.message);
+                location.reload();
+            } else {
+                alert('❌ Fehler: ' + data.data);
+            }
+        })
+        .catch(e => {
+            alert('❌ Netzwerkfehler: ' + e.message);
+        })
+        .finally(() => {
+            this.disabled = false;
+            this.textContent = '🗑️ Testbestellungen löschen';
+        });
+    });
+    */
     </script>
     <?php
     

@@ -37,7 +37,9 @@ define('NONCE_SALT',       'put your unique phrase here');
 $table_prefix = 'wp_';
 
 // ** Debug settings ** //
-define('WP_DEBUG', false);
+define('WP_DEBUG', true);
+define('WP_DEBUG_LOG', true);
+define('WP_DEBUG_DISPLAY', false);
 
 // ** WordPress paths ** //
 if (!defined('ABSPATH')) {
